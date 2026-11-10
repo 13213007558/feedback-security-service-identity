@@ -15,6 +15,7 @@ import attr
 from .exceptions import (
     CertificateError,
     DNSMismatch,
+    IdentityRuleError,
     IPAddressMismatch,
     Mismatch,
     SRVMismatch,
@@ -39,10 +40,81 @@ class ServiceMatch:
     cert_pattern: CertificatePattern = attr.ib()
 
 
+@attr.s(frozen=True, slots=True)
+class IdentityConfig:
+    """
+    Per-verification configuration of identity matching rules.
+
+    The defaults are backward-compatible with the historical behavior of
+    *service-identity* ("legacy").  Use :meth:`strict` for DNS-ID handling
+    aligned with `RFC 9525 <https://www.rfc-editor.org/rfc/rfc9525.html>`_
+    and relax individual rules while migrating callers over.
+
+    The configuration is passed per verification call, so strict and
+    legacy services can be migrated independently without loosening
+    verification process-wide.
+
+    DNS names and IP addresses always remain distinct identity types in
+    every configuration: a string that looks like an IP literal is never
+    matched as a DNS name, and vice versa.
+
+    .. versionadded:: 26.2.0
+    """
+
+    allow_partial_wildcards: bool = attr.ib(default=True)
+    """
+    Tolerate wildcards that are not the complete left-most label of a DNS
+    pattern (e.g. ``ww*.example.com``).
+
+    RFC 9525 only allows ``*`` as the entire left-most label, matching
+    exactly one label.
+    """
+
+    allow_invalid_dns_syntax: bool = attr.ib(default=True)
+    """
+    Tolerate DNS patterns that violate the preferred name syntax from RFC
+    1034/1123: non-ASCII bytes (only IDNA A-labels are valid), empty
+    labels, or labels with leading/trailing hyphens.
+
+    An invalid DNS SAN is never silently ignored under a strict
+    configuration: its presence fails the verification, even if another
+    SAN would match.
+    """
+
+    allow_trailing_dot: bool = attr.ib(default=True)
+    """
+    Tolerate DNS-IDs with a trailing dot (e.g. ``www.example.com.``).
+
+    Note that even in the legacy configuration, such IDs never match a
+    certificate pattern; a strict configuration rejects them up front with
+    an :class:`service_identity.IdentityRuleError` that names this rule.
+    """
+
+    @classmethod
+    def strict(cls) -> IdentityConfig:
+        """
+        Return a configuration that handles DNS-IDs according to RFC 9525:
+
+        - wildcards only as the complete left-most label, matching exactly
+          one label,
+        - DNS patterns must be valid IDNA A-labels in preferred name
+          syntax,
+        - DNS-IDs with a trailing dot are rejected,
+        - invalid SANs fail the verification instead of being skipped.
+        """
+        return cls(
+            allow_partial_wildcards=False,
+            allow_invalid_dns_syntax=False,
+            allow_trailing_dot=False,
+        )
+
+
 def verify_service_identity(
     cert_patterns: Sequence[CertificatePattern],
     obligatory_ids: Sequence[ServiceID],
     optional_ids: Sequence[ServiceID],
+    *,
+    config: IdentityConfig | None = None,
 ) -> list[ServiceMatch]:
     """
     Verify whether *cert_patterns* are valid for *obligatory_ids* and
@@ -50,10 +122,24 @@ def verify_service_identity(
 
     *obligatory_ids* must be both present and match.  *optional_ids* must match
     if a pattern of the respective type is present.
+
+    *config* optionally overrides the identity matching rules for this
+    verification only.  If `None`, the backward-compatible defaults of
+    :class:`IdentityConfig` are used.
+
+    .. versionchanged:: 26.2.0
+        Added the optional *config* parameter.
     """
+    if config is None:
+        config = IdentityConfig()
+
     if not cert_patterns:
         msg = "Certificate does not contain any `subjectAltName`s."
         raise CertificateError(msg)
+
+    _enforce_identity_rules(
+        cert_patterns, obligatory_ids, optional_ids, config
+    )
 
     errors = []
     matches = _find_matches(cert_patterns, obligatory_ids) + _find_matches(
@@ -108,6 +194,104 @@ def _find_matches(
 
 def _contains_instance_of(seq: Sequence[object], cl: type) -> bool:
     return any(isinstance(e, cl) for e in seq)
+
+
+def _enforce_identity_rules(
+    cert_patterns: Sequence[CertificatePattern],
+    obligatory_ids: Sequence[ServiceID],
+    optional_ids: Sequence[ServiceID],
+    config: IdentityConfig,
+) -> None:
+    """
+    Enforce the rules of *config* on all patterns and service IDs.
+
+    Raises an IdentityRuleError naming the violated rule, so an invalid
+    SAN can never be silently ignored in favor of a more lenient
+    candidate.
+    """
+    if (
+        not config.allow_partial_wildcards
+        or not config.allow_invalid_dns_syntax
+    ):
+        for pattern in cert_patterns:
+            for dns_pattern in _dns_patterns_of(pattern):
+                _verify_dns_pattern_rules(dns_pattern.pattern, config)
+
+    if not config.allow_trailing_dot:
+        for service_id in (*obligatory_ids, *optional_ids):
+            _verify_service_id_rules(service_id)
+
+
+def _dns_patterns_of(pattern: CertificatePattern) -> list[DNSPattern]:
+    """
+    Return all DNS patterns contained in *pattern*.
+    """
+    if isinstance(pattern, DNSPattern):
+        return [pattern]
+    if isinstance(pattern, URIPattern | SRVPattern):
+        return [pattern.dns_pattern]
+    return []
+
+
+_RE_STRICT_DNS_LABEL = re.compile(rb"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+
+
+def _verify_dns_pattern_rules(pattern: bytes, config: IdentityConfig) -> None:
+    """
+    Check *pattern* against the DNS rules of *config*.
+    """
+    if not config.allow_partial_wildcards and b"*" in pattern:
+        parts = pattern.split(b".")
+        if parts[0] != b"*" or any(b"*" in part for part in parts[1:]):
+            raise IdentityRuleError(
+                rule="allow_partial_wildcards",
+                reason=f"DNS pattern {pattern!r} uses a wildcard that is "
+                "not the complete left-most label.",
+            )
+
+    if not config.allow_invalid_dns_syntax:
+        try:
+            pattern.decode("ascii")
+        except UnicodeDecodeError:
+            raise IdentityRuleError(
+                rule="allow_invalid_dns_syntax",
+                reason=f"DNS pattern {pattern!r} is not ASCII; "
+                "only IDNA A-labels are valid.",
+            ) from None
+
+        for label in pattern.split(b"."):
+            if label == b"*":
+                # A full-label wildcard is governed by
+                # allow_partial_wildcards, not by label syntax.
+                continue
+            # Tolerated partial wildcards don't take part in the syntax
+            # check of the remaining characters.
+            label = label.replace(b"*", b"")
+            if not label or _RE_STRICT_DNS_LABEL.match(label) is None:
+                raise IdentityRuleError(
+                    rule="allow_invalid_dns_syntax",
+                    reason=f"DNS pattern {pattern!r} violates the "
+                    "preferred DNS name syntax (empty label, "
+                    "leading/trailing hyphen, or invalid character).",
+                )
+
+
+def _verify_service_id_rules(service_id: ServiceID) -> None:
+    """
+    Check *service_id* against the strict DNS-ID rules.
+    """
+    dns_id = None
+    if isinstance(service_id, DNS_ID):
+        dns_id = service_id
+    elif isinstance(service_id, URI_ID | SRV_ID):
+        dns_id = service_id.dns_id
+
+    if dns_id is not None and dns_id.hostname.endswith(b"."):
+        raise IdentityRuleError(
+            rule="allow_trailing_dot",
+            reason=f"DNS-ID {dns_id.hostname!r} has a trailing dot; "
+            "strip it or relax the rule.",
+        )
 
 
 def _is_ip_address(pattern: str | bytes) -> bool:

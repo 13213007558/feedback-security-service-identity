@@ -47,6 +47,17 @@ Hazardous Materials
    They are stable and they've been using internally by *service-identity* for years, but you need to know what you're doing.
 
 
+Configuration
+-------------
+
+The following object allows you to override the identity matching rules per verification call.
+It is accepted by all high-level verification functions as the optional *config* argument.
+
+
+.. autoclass:: IdentityConfig
+   :members: strict, allow_partial_wildcards, allow_invalid_dns_syntax, allow_trailing_dot
+
+
 Pattern Objects
 ---------------
 
@@ -75,4 +86,5 @@ Universal Errors and Warnings
 
 .. autoexception:: VerificationError
 .. autoexception:: CertificateError
+.. autoexception:: IdentityRuleError
 .. autoexception:: SubjectAltNameWarning

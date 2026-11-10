@@ -15,6 +15,12 @@ You can find out backwards-compatibility policy [here](https://github.com/pyca/s
 
 ## [Unreleased](https://github.com/pyca/service-identity/compare/26.1.0...HEAD)
 
+### Added
+
+- All verification functions now accept an optional per-call *config* argument taking a `service_identity.hazmat.IdentityConfig`.
+  `IdentityConfig.strict()` enables DNS-ID handling aligned with RFC 9525 (full-label wildcards matching exactly one label, IDNA A-label-only DNS SANs in preferred name syntax, rejection of trailing-dot DNS-IDs, and invalid SANs failing verification instead of being skipped), while the defaults remain backward-compatible.
+  Rule violations raise the new `service_identity.IdentityRuleError` (a `CertificateError` subclass) whose `rule` attribute names the `IdentityConfig` field that a migrating caller needs to adjust.
+
 ### Removed
 
 - Support for Python 3.8 and 3.9.

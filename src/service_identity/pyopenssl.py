@@ -13,6 +13,7 @@ from .cryptography import extract_patterns as _cryptography_extract_patterns
 from .hazmat import (
     DNS_ID,
     CertificatePattern,
+    IdentityConfig,
     IPAddress_ID,
     verify_service_identity,
 )
@@ -27,7 +28,12 @@ with contextlib.suppress(ImportError):
 __all__ = ["verify_hostname"]
 
 
-def verify_hostname(connection: Connection, hostname: str) -> None:
+def verify_hostname(
+    connection: Connection,
+    hostname: str,
+    *,
+    config: IdentityConfig | None = None,
+) -> None:
     r"""
     Verify whether the certificate of *connection* is valid for *hostname*.
 
@@ -35,6 +41,12 @@ def verify_hostname(connection: Connection, hostname: str) -> None:
         connection: A pyOpenSSL connection object.
 
         hostname: The hostname that *connection* should be connected to.
+
+        config:
+            An optional :class:`service_identity.hazmat.IdentityConfig`
+            that overrides the identity matching rules for this
+            verification only.  If `None`, the backward-compatible
+            defaults are used.
 
     Raises:
         service_identity.VerificationError:
@@ -50,6 +62,9 @@ def verify_hostname(connection: Connection, hostname: str) -> None:
         :exc:`~service_identity.CertificateError` is raised if the certificate
         contains no ``subjectAltName``\ s instead of
         :exc:`~service_identity.VerificationError`.
+
+    .. versionchanged:: 26.2.0
+        Added the optional *config* parameter.
     """
     verify_service_identity(
         cert_patterns=extract_patterns(
@@ -57,10 +72,16 @@ def verify_hostname(connection: Connection, hostname: str) -> None:
         ),
         obligatory_ids=[DNS_ID(hostname)],
         optional_ids=[],
+        config=config,
     )
 
 
-def verify_ip_address(connection: Connection, ip_address: str) -> None:
+def verify_ip_address(
+    connection: Connection,
+    ip_address: str,
+    *,
+    config: IdentityConfig | None = None,
+) -> None:
     r"""
     Verify whether the certificate of *connection* is valid for *ip_address*.
 
@@ -70,6 +91,12 @@ def verify_ip_address(connection: Connection, ip_address: str) -> None:
         ip_address:
             The IP address that *connection* should be connected to. Can be an
             IPv4 or IPv6 address.
+
+        config:
+            An optional :class:`service_identity.hazmat.IdentityConfig`
+            that overrides the identity matching rules for this
+            verification only.  If `None`, the backward-compatible
+            defaults are used.
 
     Raises:
         service_identity.VerificationError:
@@ -86,6 +113,9 @@ def verify_ip_address(connection: Connection, ip_address: str) -> None:
         :exc:`~service_identity.CertificateError` is raised if the certificate
         contains no ``subjectAltName``\ s instead of
         :exc:`~service_identity.VerificationError`.
+
+    .. versionchanged:: 26.2.0
+        Added the optional *config* parameter.
     """
     verify_service_identity(
         cert_patterns=extract_patterns(
@@ -93,6 +123,7 @@ def verify_ip_address(connection: Connection, ip_address: str) -> None:
         ),
         obligatory_ids=[IPAddress_ID(ip_address)],
         optional_ids=[],
+        config=config,
     )
 
 

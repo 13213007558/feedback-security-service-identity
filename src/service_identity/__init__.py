@@ -5,6 +5,7 @@ Verify service identities.
 from . import cryptography, hazmat, pyopenssl
 from .exceptions import (
     CertificateError,
+    IdentityRuleError,
     SubjectAltNameWarning,
     VerificationError,
 )
@@ -20,6 +21,7 @@ __copyright__ = "Copyright (c) 2014 " + __author__
 
 __all__ = [
     "CertificateError",
+    "IdentityRuleError",
     "SubjectAltNameWarning",
     "VerificationError",
     "cryptography",

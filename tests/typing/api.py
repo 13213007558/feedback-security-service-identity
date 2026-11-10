@@ -30,6 +30,14 @@ service_identity.cryptography.verify_certificate_ip_address(
     c_cert, "127.0.0.1"
 )
 
+config = service_identity.hazmat.IdentityConfig.strict()
+service_identity.cryptography.verify_certificate_hostname(
+    c_cert, "example.com", config=config
+)
+service_identity.cryptography.verify_certificate_ip_address(
+    c_cert, "127.0.0.1", config=config
+)
+
 
 ctx = SSL.Context(SSL.TLSv1_2_METHOD)
 conn = SSL.Connection(ctx, socket.socket(socket.AF_INET, socket.SOCK_STREAM))
@@ -41,3 +49,5 @@ p_ids: Sequence[service_identity.hazmat.CertificatePattern] = (
 )
 service_identity.pyopenssl.verify_hostname(conn, "example.com")
 service_identity.pyopenssl.verify_ip_address(conn, "127.0.0.1")
+service_identity.pyopenssl.verify_hostname(conn, "example.com", config=config)
+service_identity.pyopenssl.verify_ip_address(conn, "127.0.0.1", config=config)

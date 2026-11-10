@@ -25,6 +25,7 @@ from .hazmat import (
     DNS_ID,
     CertificatePattern,
     DNSPattern,
+    IdentityConfig,
     IPAddress_ID,
     IPAddressPattern,
     SRVPattern,
@@ -37,7 +38,10 @@ __all__ = ["verify_certificate_hostname"]
 
 
 def verify_certificate_hostname(
-    certificate: Certificate, hostname: str
+    certificate: Certificate,
+    hostname: str,
+    *,
+    config: IdentityConfig | None = None,
 ) -> None:
     r"""
     Verify whether *certificate* is valid for *hostname*.
@@ -52,6 +56,12 @@ def verify_certificate_hostname(
 
         hostname: The hostname that *certificate* should be valid for.
 
+        config:
+            An optional :class:`service_identity.hazmat.IdentityConfig`
+            that overrides the identity matching rules for this
+            verification only.  If `None`, the backward-compatible
+            defaults are used.
+
     Raises:
         service_identity.VerificationError:
             If *certificate* is not valid for *hostname*.
@@ -64,16 +74,23 @@ def verify_certificate_hostname(
         :exc:`~service_identity.CertificateError` is raised if the certificate
         contains no ``subjectAltName``\ s instead of
         :exc:`~service_identity.VerificationError`.
+
+    .. versionchanged:: 26.2.0
+        Added the optional *config* parameter.
     """
     verify_service_identity(
         cert_patterns=extract_patterns(certificate),
         obligatory_ids=[DNS_ID(hostname)],
         optional_ids=[],
+        config=config,
     )
 
 
 def verify_certificate_ip_address(
-    certificate: Certificate, ip_address: str
+    certificate: Certificate,
+    ip_address: str,
+    *,
+    config: IdentityConfig | None = None,
 ) -> None:
     r"""
     Verify whether *certificate* is valid for *ip_address*.
@@ -90,6 +107,12 @@ def verify_certificate_ip_address(
             The IP address that *connection* should be valid for.  Can be an
             IPv4 or IPv6 address.
 
+        config:
+            An optional :class:`service_identity.hazmat.IdentityConfig`
+            that overrides the identity matching rules for this
+            verification only.  If `None`, the backward-compatible
+            defaults are used.
+
     Raises:
         service_identity.VerificationError:
             If *certificate* is not valid for *ip_address*.
@@ -104,11 +127,15 @@ def verify_certificate_ip_address(
         :exc:`~service_identity.CertificateError` is raised if the certificate
         contains no ``subjectAltName``\ s instead of
         :exc:`~service_identity.VerificationError`.
+
+    .. versionchanged:: 26.2.0
+        Added the optional *config* parameter.
     """
     verify_service_identity(
         cert_patterns=extract_patterns(certificate),
         obligatory_ids=[IPAddress_ID(ip_address)],
         optional_ids=[],
+        config=config,
     )
 
 

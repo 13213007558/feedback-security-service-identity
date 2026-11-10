@@ -79,3 +79,24 @@ class CertificateError(Exception):
     This includes the case where s certificate contains no
     ``subjectAltName``\ s.
     """
+
+
+@attr.s(auto_exc=True)
+class IdentityRuleError(CertificateError):
+    """
+    A certificate pattern or service ID violates a rule of the active
+    identity configuration.
+
+    The *rule* attribute names the
+    :class:`service_identity.hazmat.IdentityConfig` field that governs the
+    violated rule, so migrating callers can tell exactly which rule they
+    need to adjust (or temporarily relax).
+
+    .. versionadded:: 26.2.0
+    """
+
+    rule: str = attr.ib()
+    reason: str = attr.ib()
+
+    def __str__(self) -> str:
+        return f"identity rule {self.rule!r} violated: {self.reason}"
