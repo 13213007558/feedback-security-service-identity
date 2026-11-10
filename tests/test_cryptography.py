@@ -16,11 +16,13 @@ from service_identity.cryptography import (
     extract_patterns,
     verify_certificate_hostname,
     verify_certificate_ip_address,
+    verify_certificate_spiffe_id,
 )
 from service_identity.exceptions import (
     CertificateError,
     DNSMismatch,
     IPAddressMismatch,
+    SPIFFEMismatch,
     VerificationError,
 )
 from service_identity.hazmat import (
@@ -28,6 +30,8 @@ from service_identity.hazmat import (
     DNSPattern,
     IPAddress_ID,
     IPAddressPattern,
+    SPIFFE_ID,
+    SPIFFEPattern,
     SRVPattern,
     URIPattern,
 )
@@ -37,6 +41,7 @@ from .certificates import (
     PEM_DNS_ONLY,
     PEM_EVERYTHING,
     PEM_OTHER_NAME,
+    make_cert_with_sans,
 )
 
 
@@ -212,3 +217,166 @@ class TestExtractPatterns:
             == w.message.args[0]
         )
         assert __file__ == w.filename
+
+
+class TestVerifyCertificateSPIFFEID:
+    def test_ok(self):
+        """
+        verify_certificate_spiffe_id succeeds if the certificate contains
+        the exact SPIFFE ID and the trust domain is allowed. Returns the
+        matches with the full identity.
+        """
+        cert = make_cert_with_sans(
+            uris=["spiffe://example.com/ns/default/sa/web"]
+        )
+
+        matches = verify_certificate_spiffe_id(
+            cert,
+            "spiffe://example.com/ns/default/sa/web",
+            ["example.com"],
+        )
+
+        assert 1 == len(matches)
+        assert (
+            SPIFFEPattern.from_bytes(b"spiffe://example.com/ns/default/sa/web")
+            == matches[0].cert_pattern
+        )
+        assert (
+            SPIFFE_ID("spiffe://example.com/ns/default/sa/web")
+            == matches[0].service_id
+        )
+
+    def test_same_trust_domain_different_path_fails(self):
+        """
+        Same trust domain but a different path does not match: the path is
+        part of the identity.
+        """
+        cert = make_cert_with_sans(uris=["spiffe://example.com/ns/a"])
+
+        with pytest.raises(VerificationError) as ei:
+            verify_certificate_spiffe_id(
+                cert, "spiffe://example.com/ns/b", ["example.com"]
+            )
+
+        assert [
+            SPIFFEMismatch(
+                mismatched_id=SPIFFE_ID("spiffe://example.com/ns/b")
+            )
+        ] == ei.value.errors
+
+    def test_lookalike_trust_domain_fails(self):
+        """
+        Lookalike trust domains neither match nor are allowed implicitly.
+        """
+        cert = make_cert_with_sans(uris=["spiffe://example.com/ns/a"])
+
+        with pytest.raises(VerificationError):
+            verify_certificate_spiffe_id(
+                cert,
+                "spiffe://example.com.evil.org/ns/a",
+                ["example.com.evil.org"],
+            )
+
+    def test_trust_domain_not_allowed_fails(self):
+        """
+        Even a perfectly matching SPIFFE ID fails if the caller does not
+        allow its trust domain: the certificate cannot widen the scope.
+        """
+        cert = make_cert_with_sans(uris=["spiffe://evil.org/ns/a"])
+
+        with pytest.raises(VerificationError):
+            verify_certificate_spiffe_id(
+                cert, "spiffe://evil.org/ns/a", ["example.com"]
+            )
+
+    def test_multiple_spiffe_ids_rejected(self):
+        """
+        A certificate with more than one SPIFFE ID is rejected with
+        CertificateError instead of picking one by order.
+        """
+        cert = make_cert_with_sans(
+            uris=[
+                "spiffe://example.com/ns/a",
+                "spiffe://example.com/ns/b",
+            ]
+        )
+
+        with pytest.raises(
+            CertificateError,
+            match="Certificate contains more than one SPIFFE ID",
+        ):
+            verify_certificate_spiffe_id(
+                cert, "spiffe://example.com/ns/a", ["example.com"]
+            )
+
+    def test_invalid_spiffe_encoding_rejected(self):
+        """
+        A spiffe-scheme URI SAN with invalid encoding is a CertificateError,
+        not a silently normalized identity.
+        """
+        cert = make_cert_with_sans(
+            uris=["spiffe://example.com/%6e%73/a"]
+        )
+
+        with pytest.raises(CertificateError, match="Invalid SPIFFE pattern"):
+            verify_certificate_spiffe_id(
+                cert, "spiffe://example.com/ns/a", ["example.com"]
+            )
+
+    def test_ordinary_uri_san_cannot_impersonate(self):
+        """
+        An ordinary URI SAN never satisfies a SPIFFE-ID.
+        """
+        cert = make_cert_with_sans(uris=["https://example.com/ns/a"])
+
+        with pytest.raises(VerificationError):
+            verify_certificate_spiffe_id(
+                cert, "spiffe://example.com/ns/a", ["example.com"]
+            )
+
+    def test_mixed_sans(self):
+        """
+        DNS and ordinary URI SANs coexist with a SPIFFE ID; only the SPIFFE
+        ID is considered for SPIFFE verification.
+        """
+        cert = make_cert_with_sans(
+            uris=[
+                "https://example.com/",
+                "spiffe://example.com/ns/default/sa/web",
+            ],
+            dns_names=["example.com"],
+        )
+
+        verify_certificate_spiffe_id(
+            cert,
+            "spiffe://example.com/ns/default/sa/web",
+            ["example.com"],
+        )
+        verify_certificate_hostname(cert, "example.com")
+
+
+class TestExtractPatternsSPIFFE:
+    def test_spiffe_uri_becomes_spiffe_pattern(self):
+        """
+        URI SANs with the spiffe scheme are extracted as SPIFFEPatterns.
+        """
+        cert = make_cert_with_sans(
+            uris=["spiffe://example.com/ns/a", "https://example.com/"]
+        )
+
+        rv = extract_patterns(cert)
+
+        assert [
+            SPIFFEPattern.from_bytes(b"spiffe://example.com/ns/a"),
+            URIPattern.from_bytes(b"https://example.com/"),
+        ] == rv
+
+    def test_invalid_spiffe_uri_raises(self):
+        """
+        A URI SAN claiming the spiffe scheme but violating the SPIFFE ID
+        syntax raises CertificateError on extraction.
+        """
+        cert = make_cert_with_sans(uris=["spiffe://example.com/a b"])
+
+        with pytest.raises(CertificateError, match="Invalid SPIFFE pattern"):
+            extract_patterns(cert)

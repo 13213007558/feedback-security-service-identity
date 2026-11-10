@@ -60,6 +60,12 @@ class IPAddressMismatch(Mismatch):
     """
 
 
+class SPIFFEMismatch(Mismatch):
+    """
+    No matching SPIFFEPattern could be found.
+    """
+
+
 @attr.s(auto_exc=True)
 class VerificationError(Exception):
     """

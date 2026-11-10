@@ -17,6 +17,7 @@ from .exceptions import (
     DNSMismatch,
     IPAddressMismatch,
     Mismatch,
+    SPIFFEMismatch,
     SRVMismatch,
     URIMismatch,
     VerificationError,
@@ -254,7 +255,47 @@ class SRVPattern:
         )
 
 
-CertificatePattern = SRVPattern | URIPattern | DNSPattern | IPAddressPattern
+@attr.s(slots=True)
+class SPIFFEPattern:
+    """
+    A SPIFFE ID pattern as extracted from certificates.
+
+    Contains the full workload identity: trust domain and path. No
+    normalization beyond the SPIFFE ID syntax rules is applied, so distinct
+    identities stay distinct.
+    """
+
+    #: The trust domain part.
+    trust_domain: bytes = attr.ib()
+    #: The path part, including the leading slash. Empty if absent.
+    path: bytes = attr.ib()
+
+    @classmethod
+    def from_bytes(cls, pattern: bytes) -> SPIFFEPattern:
+        if not isinstance(pattern, bytes):
+            msg = "The SPIFFE pattern must be a bytes string."
+            raise TypeError(msg)
+
+        pattern = pattern.strip()
+
+        try:
+            text = pattern.decode("ascii")
+        except UnicodeDecodeError:
+            msg = f"Invalid SPIFFE pattern {pattern!r}."
+            raise CertificateError(msg) from None
+
+        try:
+            trust_domain, path = _parse_spiffe_id(text)
+        except ValueError:
+            msg = f"Invalid SPIFFE pattern {pattern!r}."
+            raise CertificateError(msg) from None
+
+        return cls(trust_domain=trust_domain, path=path)
+
+
+CertificatePattern = (
+    SRVPattern | URIPattern | DNSPattern | IPAddressPattern | SPIFFEPattern
+)
 """
 A :class:`Union` of all possible patterns that can be extracted from a
 certificate.
@@ -419,6 +460,165 @@ class SRV_ID:
             )
 
         return False
+
+
+@attr.s(init=False, slots=True)
+class SPIFFE_ID:
+    """
+    A SPIFFE ID service ID as defined by the
+    `SPIFFE specification <https://github.com/spiffe/spiffe/blob/main/standards/SPIFFE-ID.md>`_.
+
+    The full identity -- trust domain and path -- is matched byte-for-byte.
+    No URL normalization is applied that could merge distinct workload
+    identities.
+    """
+
+    trust_domain: bytes = attr.ib()
+    path: bytes = attr.ib()
+
+    pattern_class = SPIFFEPattern
+    error_on_mismatch = SPIFFEMismatch
+
+    def __init__(self, spiffe_id: str):
+        if not isinstance(spiffe_id, str):
+            msg = "SPIFFE-ID must be a text string."
+            raise TypeError(msg)
+
+        self.trust_domain, self.path = _parse_spiffe_id(spiffe_id.strip())
+
+    def verify(self, pattern: CertificatePattern) -> bool:
+        """
+        Exact match of the full SPIFFE ID.
+        """
+        if isinstance(pattern, self.pattern_class):
+            return (
+                pattern.trust_domain == self.trust_domain
+                and pattern.path == self.path
+            )
+
+        return False
+
+
+def verify_spiffe_identity(
+    cert_patterns: Sequence[CertificatePattern],
+    spiffe_id: SPIFFE_ID,
+    allowed_trust_domains: Sequence[str],
+) -> list[ServiceMatch]:
+    """
+    Verify whether *cert_patterns* contain *spiffe_id* under the caller's
+    trust domain policy.
+
+    Follows the X.509-SVID policy that a workload certificate carries at
+    most one SPIFFE ID: if multiple SPIFFE IDs are present, a
+    :exc:`CertificateError` is raised instead of picking one by order.
+
+    *allowed_trust_domains* is provided by the caller; the certificate's
+    contents can never widen it. If *spiffe_id*'s trust domain is not
+    allowed, a :exc:`VerificationError` is raised.
+
+    Returns the matches so the caller can inspect the full matched identity.
+    """
+    allowed = set()
+    for trust_domain in allowed_trust_domains:
+        if not isinstance(trust_domain, str):
+            msg = "Trust domains must be text strings."
+            raise TypeError(msg)
+
+        trust_domain = trust_domain.strip()
+        if _RE_SPIFFE_TRUST_DOMAIN.match(trust_domain) is None:
+            msg = f"Invalid trust domain {trust_domain!r}."
+            raise ValueError(msg)
+
+        allowed.add(trust_domain.encode("ascii"))
+
+    if sum(isinstance(p, SPIFFEPattern) for p in cert_patterns) > 1:
+        msg = "Certificate contains more than one SPIFFE ID."
+        raise CertificateError(msg)
+
+    if spiffe_id.trust_domain not in allowed:
+        raise VerificationError(
+            errors=[spiffe_id.error_on_mismatch(mismatched_id=spiffe_id)]
+        )
+
+    return verify_service_identity(
+        cert_patterns=cert_patterns,
+        obligatory_ids=[spiffe_id],
+        optional_ids=[],
+    )
+
+
+_SPIFFE_PREFIX = "spiffe://"
+
+# Trust domains are lowercase ASCII: letters, digits, dot, hyphen, and
+# underscore. Anything else (including uppercase and percent-encoding) is
+# rejected instead of normalized.
+_RE_SPIFFE_TRUST_DOMAIN = re.compile(r"^[a-z0-9._-]{1,255}$")
+
+# Path segments may also contain uppercase letters.
+_RE_SPIFFE_PATH_SEGMENT = re.compile(r"^[a-zA-Z0-9._-]+$")
+
+
+def _parse_spiffe_id(spiffe_id: str) -> tuple[bytes, bytes]:
+    """
+    Parse *spiffe_id* into its trust domain and path parts, validating the
+    SPIFFE ID syntax strictly.
+
+    No generic URL normalization is performed: userinfo, ports, queries,
+    fragments, percent-encoding, and dot-segments are rejected rather than
+    resolved.
+
+    Returns:
+        (trust_domain, path) as bytes. The path includes the leading slash
+        and is empty if absent.
+
+    Raises:
+        ValueError: If *spiffe_id* is not a valid SPIFFE ID.
+    """
+    if not spiffe_id.startswith(_SPIFFE_PREFIX):
+        msg = f"Invalid SPIFFE-ID {spiffe_id!r}: scheme must be 'spiffe'."
+        raise ValueError(msg)
+
+    rest = spiffe_id[len(_SPIFFE_PREFIX) :]
+
+    if "%" in rest:
+        msg = f"Invalid SPIFFE-ID {spiffe_id!r}: percent-encoding is not allowed."
+        raise ValueError(msg)
+
+    if "?" in rest or "#" in rest:
+        msg = f"Invalid SPIFFE-ID {spiffe_id!r}: query and fragment are not allowed."
+        raise ValueError(msg)
+
+    trust_domain, sep, remainder = rest.partition("/")
+    path = sep + remainder
+
+    if "@" in trust_domain:
+        msg = f"Invalid SPIFFE-ID {spiffe_id!r}: userinfo is not allowed."
+        raise ValueError(msg)
+
+    if ":" in trust_domain:
+        msg = f"Invalid SPIFFE-ID {spiffe_id!r}: ports are not allowed."
+        raise ValueError(msg)
+
+    if _RE_SPIFFE_TRUST_DOMAIN.match(trust_domain) is None:
+        msg = f"Invalid SPIFFE-ID {spiffe_id!r}: invalid trust domain."
+        raise ValueError(msg)
+
+    if path:
+        # The segment before the first slash is always empty.
+        for segment in path.split("/")[1:]:
+            if not segment:
+                msg = f"Invalid SPIFFE-ID {spiffe_id!r}: empty path segments are not allowed."
+                raise ValueError(msg)
+
+            if segment in (".", ".."):
+                msg = f"Invalid SPIFFE-ID {spiffe_id!r}: dot-segments are not allowed."
+                raise ValueError(msg)
+
+            if _RE_SPIFFE_PATH_SEGMENT.match(segment) is None:
+                msg = f"Invalid SPIFFE-ID {spiffe_id!r}: invalid characters in path."
+                raise ValueError(msg)
+
+    return trust_domain.encode("ascii"), path.encode("ascii")
 
 
 def _hostname_matches(cert_pattern: bytes, actual_hostname: bytes) -> bool:

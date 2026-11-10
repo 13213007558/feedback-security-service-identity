@@ -23,13 +23,17 @@ from cryptography.x509.extensions import ExtensionNotFound
 from .exceptions import CertificateError
 from .hazmat import (
     DNS_ID,
+    SPIFFE_ID,
     CertificatePattern,
     DNSPattern,
     IPAddress_ID,
     IPAddressPattern,
+    ServiceMatch,
+    SPIFFEPattern,
     SRVPattern,
     URIPattern,
     verify_service_identity,
+    verify_spiffe_identity,
 )
 
 
@@ -115,8 +119,59 @@ def verify_certificate_ip_address(
 ID_ON_DNS_SRV = ObjectIdentifier("1.3.6.1.5.5.7.8.7")  # id_on_dnsSRV
 
 
-def extract_patterns(cert: Certificate) -> Sequence[CertificatePattern]:
+def verify_certificate_spiffe_id(
+    certificate: Certificate,
+    spiffe_id: str,
+    allowed_trust_domains: Sequence[str],
+) -> list[ServiceMatch]:
+    r"""
+    Verify whether *certificate* contains the SPIFFE ID *spiffe_id* and the
+    ID's trust domain is within *allowed_trust_domains*.
+
+    The full identity -- trust domain and path -- must match exactly; no URL
+    normalization is applied. Following the X.509-SVID policy, a certificate
+    containing more than one SPIFFE ID is rejected with
+    :exc:`~service_identity.CertificateError` instead of picking one by
+    order.
+
+    .. note::
+        Only the *identity* is verified here. Nothing is verified about the
+        *authority* of the certificate; the caller must verify that the
+        certificate chains to an appropriate trust root themselves.
+
+    Args:
+        certificate: A *cryptography* X509 certificate object.
+
+        spiffe_id: The SPIFFE ID that *certificate* should contain, e.g.
+            ``spiffe://example.com/ns/default/sa/web``.
+
+        allowed_trust_domains: Trust domains the caller trusts. The
+            certificate's contents can never widen this set.
+
+    Returns:
+        The list of matches, including the full matched identity.
+
+    Raises:
+        service_identity.VerificationError:
+            If *certificate* does not contain *spiffe_id*, or its trust
+            domain is not allowed.
+
+        service_identity.CertificateError:
+            If *certificate* contains invalid / unexpected data. This
+            includes the case where the certificate contains no
+            ``subjectAltName``\ s or more than one SPIFFE ID.
+
+    .. versionadded:: 26.2.0
     """
+    return verify_spiffe_identity(
+        cert_patterns=extract_patterns(certificate),
+        spiffe_id=SPIFFE_ID(spiffe_id),
+        allowed_trust_domains=allowed_trust_domains,
+    )
+
+
+def extract_patterns(cert: Certificate) -> Sequence[CertificatePattern]:
+    r"""
     Extract all valid ID patterns from a certificate for service verification.
 
     Args:
@@ -127,6 +182,10 @@ def extract_patterns(cert: Certificate) -> Sequence[CertificatePattern]:
 
     .. versionchanged:: 23.1.0
        ``commonName`` is not used as a fallback anymore.
+
+    .. versionchanged:: 26.2.0
+       URI SANs with the ``spiffe`` scheme are extracted as
+       ``SPIFFEPattern``\ s instead of ``URIPattern``\ s.
     """
     ids: list[CertificatePattern] = []
     try:
@@ -142,14 +201,14 @@ def extract_patterns(cert: Certificate) -> Sequence[CertificatePattern]:
                 for name in ext.value.get_values_for_type(DNSName)
             ]
         )
-        ids.extend(
-            [
-                URIPattern.from_bytes(uri.encode("utf-8"))
-                for uri in ext.value.get_values_for_type(
-                    UniformResourceIdentifier
-                )
-            ]
-        )
+        for uri in ext.value.get_values_for_type(UniformResourceIdentifier):
+            if uri.startswith("spiffe:"):
+                # A URI SAN claiming the spiffe scheme must be a fully valid
+                # SPIFFE ID; anything else is a certificate error. Ordinary
+                # URI SANs can never match a SPIFFE-ID.
+                ids.append(SPIFFEPattern.from_bytes(uri.encode("utf-8")))
+            else:
+                ids.append(URIPattern.from_bytes(uri.encode("utf-8")))
         ids.extend(
             [
                 IPAddressPattern(ip)

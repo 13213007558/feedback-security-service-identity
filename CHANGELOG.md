@@ -15,6 +15,14 @@ You can find out backwards-compatibility policy [here](https://github.com/pyca/s
 
 ## [Unreleased](https://github.com/pyca/service-identity/compare/26.1.0...HEAD)
 
+### Added
+
+- Support for verifying [SPIFFE IDs](https://github.com/spiffe/spiffe/blob/main/standards/SPIFFE-ID.md) in URI SANs.
+  The full identity -- trust domain and path -- is matched exactly, without URL normalization that could merge distinct workload identities.
+  Allowed trust domains are always supplied by the caller; the certificate's contents can never widen them.
+  Following the X.509-SVID policy, certificates containing more than one SPIFFE ID are rejected instead of picking one by order.
+  New APIs: `service_identity.cryptography.verify_certificate_spiffe_id()`, `service_identity.pyopenssl.verify_spiffe_id()`, and `service_identity.hazmat.SPIFFE_ID` / `service_identity.hazmat.SPIFFEPattern`.
+
 ### Removed
 
 - Support for Python 3.8 and 3.9.

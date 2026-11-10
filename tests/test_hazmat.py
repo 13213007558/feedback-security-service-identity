@@ -9,16 +9,19 @@ from service_identity.cryptography import extract_patterns
 from service_identity.exceptions import (
     CertificateError,
     DNSMismatch,
+    SPIFFEMismatch,
     SRVMismatch,
     VerificationError,
 )
 from service_identity.hazmat import (
     DNS_ID,
+    SPIFFE_ID,
     SRV_ID,
     URI_ID,
     DNSPattern,
     IPAddress_ID,
     IPAddressPattern,
+    SPIFFEPattern,
     ServiceMatch,
     SRVPattern,
     URIPattern,
@@ -28,6 +31,7 @@ from service_identity.hazmat import (
     _is_ip_address,
     _validate_pattern,
     verify_service_identity,
+    verify_spiffe_identity,
 )
 
 from .certificates import DNS_IDS
@@ -740,3 +744,264 @@ class TestVerificationError:
         # Exceptions can't be compared.
         assert exc.__class__ == new_exc.__class__
         assert exc.__dict__ == new_exc.__dict__
+
+
+class TestSPIFFEPattern:
+    def test_from_bytes(self):
+        """
+        A SPIFFE pattern is parsed into trust domain and path.
+        """
+        pattern = SPIFFEPattern.from_bytes(
+            b"spiffe://example.com/ns/default/sa/web"
+        )
+
+        assert b"example.com" == pattern.trust_domain
+        assert b"/ns/default/sa/web" == pattern.path
+
+    def test_from_bytes_no_path(self):
+        """
+        A SPIFFE pattern without a path has an empty path.
+        """
+        pattern = SPIFFEPattern.from_bytes(b"spiffe://example.com")
+
+        assert b"example.com" == pattern.trust_domain
+        assert b"" == pattern.path
+
+    def test_from_bytes_must_be_bytes(self):
+        """
+        Raise TypeError if pattern is not bytes.
+        """
+        with pytest.raises(TypeError):
+            SPIFFEPattern.from_bytes("spiffe://example.com")
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            # Wrong scheme / no scheme.
+            b"https://example.com/workload",
+            b"example.com/workload",
+            # Scheme must be lowercase; no case folding.
+            b"SPIFFE://example.com/workload",
+            # No userinfo or ports.
+            b"spiffe://user@example.com/workload",
+            b"spiffe://example.com:443/workload",
+            # No query or fragment.
+            b"spiffe://example.com/workload?foo=bar",
+            b"spiffe://example.com/workload#fragment",
+            # No percent-encoding.
+            b"spiffe://example.com/%77orkload",
+            b"spiffe://example.com/workload%2f..",
+            # No dot-segments.
+            b"spiffe://example.com/./workload",
+            b"spiffe://example.com/../workload",
+            b"spiffe://example.com/a/../../b",
+            # No empty path segments or trailing slashes.
+            b"spiffe://example.com//workload",
+            b"spiffe://example.com/workload/",
+            b"spiffe://example.com/",
+            # Trust domain must be lowercase ASCII.
+            b"spiffe://Example.COM/workload",
+            b"spiffe://ex ample.com/workload",
+            b"spiffe:///workload",
+            # Non-ASCII.
+            "spiffe://exämple.com/workload".encode(),
+        ],
+    )
+    def test_from_bytes_invalid(self, pattern):
+        """
+        Invalid SPIFFE patterns raise CertificateError instead of being
+        normalized into a valid identity.
+        """
+        with pytest.raises(CertificateError, match="Invalid SPIFFE pattern"):
+            SPIFFEPattern.from_bytes(pattern)
+
+
+class TestSPIFFE_ID:
+    def test_init(self):
+        """
+        A SPIFFE-ID is parsed into trust domain and path.
+        """
+        spiffe_id = SPIFFE_ID("spiffe://example.com/ns/default/sa/web")
+
+        assert b"example.com" == spiffe_id.trust_domain
+        assert b"/ns/default/sa/web" == spiffe_id.path
+
+    def test_init_must_be_str(self):
+        """
+        Raise TypeError if spiffe_id is not a text string.
+        """
+        with pytest.raises(TypeError):
+            SPIFFE_ID(b"spiffe://example.com/workload")
+
+    @pytest.mark.parametrize(
+        "spiffe_id",
+        [
+            "spiffe://user@example.com/workload",
+            "spiffe://example.com:443/workload",
+            "spiffe://example.com/workload?foo=bar",
+            "spiffe://example.com/workload#fragment",
+            "spiffe://example.com/%77orkload",
+            "spiffe://example.com/../workload",
+            "spiffe://example.com//workload",
+            "spiffe://example.com/workload/",
+            "SPIFFE://example.com/workload",
+            "spiffe://Example.com/workload",
+            "https://example.com/workload",
+        ],
+    )
+    def test_init_invalid(self, spiffe_id):
+        """
+        Invalid SPIFFE-IDs raise ValueError.
+        """
+        with pytest.raises(ValueError, match="Invalid SPIFFE-ID"):
+            SPIFFE_ID(spiffe_id)
+
+    def test_verify_full_identity_match(self):
+        """
+        Trust domain and path must both match exactly.
+        """
+        spiffe_id = SPIFFE_ID("spiffe://example.com/ns/a")
+
+        assert spiffe_id.verify(
+            SPIFFEPattern.from_bytes(b"spiffe://example.com/ns/a")
+        )
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            # Same trust domain, different path.
+            b"spiffe://example.com/ns/b",
+            b"spiffe://example.com/ns/a/other",
+            b"spiffe://example.com",
+            # Lookalike trust domains.
+            b"spiffe://example.com.evil.org/ns/a",
+            b"spiffe://notexample.com/ns/a",
+            b"spiffe://example-com/ns/a",
+        ],
+    )
+    def test_verify_no_merge(self, pattern):
+        """
+        Similar but distinct identities never match; no normalization merges
+        them.
+        """
+        spiffe_id = SPIFFE_ID("spiffe://example.com/ns/a")
+
+        assert not spiffe_id.verify(SPIFFEPattern.from_bytes(pattern))
+
+    def test_verify_ignores_other_pattern_types(self):
+        """
+        An ordinary URI pattern never matches a SPIFFE-ID, even with
+        identical text.
+        """
+        spiffe_id = SPIFFE_ID("spiffe://example.com/ns/a")
+
+        assert not spiffe_id.verify(
+            URIPattern.from_bytes(b"http://example.com/ns/a")
+        )
+        assert not spiffe_id.verify(DNSPattern.from_bytes(b"example.com"))
+
+
+class TestVerifySpiffeIdentity:
+    def test_success_returns_full_identity(self):
+        """
+        On success, the matches carry the full matched identity.
+        """
+        spiffe_id = SPIFFE_ID("spiffe://example.com/ns/default/sa/web")
+
+        rv = verify_spiffe_identity(
+            cert_patterns=[
+                SPIFFEPattern.from_bytes(
+                    b"spiffe://example.com/ns/default/sa/web"
+                )
+            ],
+            spiffe_id=spiffe_id,
+            allowed_trust_domains=["example.com"],
+        )
+
+        assert [
+            ServiceMatch(
+                cert_pattern=SPIFFEPattern.from_bytes(
+                    b"spiffe://example.com/ns/default/sa/web"
+                ),
+                service_id=spiffe_id,
+            )
+        ] == rv
+
+    def test_mismatch(self):
+        """
+        A non-matching SPIFFE ID raises VerificationError.
+        """
+        spiffe_id = SPIFFE_ID("spiffe://example.com/ns/b")
+
+        with pytest.raises(VerificationError) as ei:
+            verify_spiffe_identity(
+                cert_patterns=[
+                    SPIFFEPattern.from_bytes(b"spiffe://example.com/ns/a")
+                ],
+                spiffe_id=spiffe_id,
+                allowed_trust_domains=["example.com"],
+            )
+
+        assert [SPIFFEMismatch(mismatched_id=spiffe_id)] == ei.value.errors
+
+    def test_multiple_spiffe_ids_rejected(self):
+        """
+        A certificate with more than one SPIFFE ID is rejected explicitly
+        instead of picking one by order.
+        """
+        with pytest.raises(
+            CertificateError,
+            match="Certificate contains more than one SPIFFE ID",
+        ):
+            verify_spiffe_identity(
+                cert_patterns=[
+                    SPIFFEPattern.from_bytes(b"spiffe://example.com/a"),
+                    SPIFFEPattern.from_bytes(b"spiffe://example.com/b"),
+                ],
+                spiffe_id=SPIFFE_ID("spiffe://example.com/a"),
+                allowed_trust_domains=["example.com"],
+            )
+
+    def test_trust_domain_not_allowed(self):
+        """
+        Even a perfectly matching SPIFFE ID fails if its trust domain is not
+        in the caller-provided allowed set.
+        """
+        spiffe_id = SPIFFE_ID("spiffe://evil.org/ns/a")
+
+        with pytest.raises(VerificationError) as ei:
+            verify_spiffe_identity(
+                cert_patterns=[
+                    SPIFFEPattern.from_bytes(b"spiffe://evil.org/ns/a")
+                ],
+                spiffe_id=spiffe_id,
+                allowed_trust_domains=["example.com"],
+            )
+
+        assert [SPIFFEMismatch(mismatched_id=spiffe_id)] == ei.value.errors
+
+    def test_empty_allowed_trust_domains_fails_closed(self):
+        """
+        Without allowed trust domains, nothing verifies.
+        """
+        spiffe_id = SPIFFE_ID("spiffe://example.com/ns/a")
+
+        with pytest.raises(VerificationError):
+            verify_spiffe_identity(
+                cert_patterns=[
+                    SPIFFEPattern.from_bytes(b"spiffe://example.com/ns/a")
+                ],
+                spiffe_id=spiffe_id,
+                allowed_trust_domains=[],
+            )
+
+    def test_invalid_allowed_trust_domain(self):
+        """
+        Invalid entries in allowed_trust_domains raise ValueError.
+        """
+        with pytest.raises(ValueError, match="Invalid trust domain"):
+            verify_spiffe_identity(
+                cert_patterns=[],
+                spiffe_id=SPIFFE_ID("spiffe://example.com/ns/a"),
+                allowed_trust_domains=["Example.COM"],
+            )

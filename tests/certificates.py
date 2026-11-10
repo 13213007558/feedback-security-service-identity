@@ -3,7 +3,6 @@ from cryptography.x509 import load_pem_x509_certificate
 
 from service_identity.cryptography import extract_patterns
 
-
 # Test certificates
 
 PEM_DNS_ONLY = b"""\
@@ -140,3 +139,44 @@ F4B0w+r2LTELSYJ6Mh+tVleuJZ6Yw947E4iAyc/u7ck6qWRex230hnHZqgRiexP2
 4ZueMI+SnpWqL7rOgLD6VuyemZ18on2VJcgvZiVkYMfZf2330ZlRxtyU2AvKRXc3
 3HotzNMgpPpx8C2KKLKKaiIGRY0pg/WC6w==
 -----END CERTIFICATE-----"""
+
+
+def make_cert_with_sans(uris=(), dns_names=()):
+    """
+    Build a self-signed certificate with the given URI and DNS SANs for
+    local testing.
+    """
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509 import (
+        DNSName,
+        SubjectAlternativeName,
+        UniformResourceIdentifier,
+    )
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name(
+        [x509.NameAttribute(x509.NameOID.COMMON_NAME, "service-identity")]
+    )
+    now = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+
+    return (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(1)
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .add_extension(
+            SubjectAlternativeName(
+                [UniformResourceIdentifier(uri) for uri in uris]
+                + [DNSName(dns_name) for dns_name in dns_names]
+            ),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )

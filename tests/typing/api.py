@@ -41,3 +41,20 @@ p_ids: Sequence[service_identity.hazmat.CertificatePattern] = (
 )
 service_identity.pyopenssl.verify_hostname(conn, "example.com")
 service_identity.pyopenssl.verify_ip_address(conn, "127.0.0.1")
+
+spiffe_matches = service_identity.cryptography.verify_certificate_spiffe_id(
+    c_cert,
+    "spiffe://example.com/ns/default/sa/web",
+    ["example.com"],
+)
+service_identity.pyopenssl.verify_spiffe_id(
+    conn,
+    "spiffe://example.com/ns/default/sa/web",
+    ["example.com"],
+)
+spiffe_id = service_identity.hazmat.SPIFFE_ID(
+    "spiffe://example.com/ns/default/sa/web"
+)
+spiffe_pattern = service_identity.hazmat.SPIFFEPattern.from_bytes(
+    b"spiffe://example.com/ns/default/sa/web"
+)

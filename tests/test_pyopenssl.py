@@ -5,6 +5,7 @@ import pytest
 from service_identity.exceptions import (
     DNSMismatch,
     IPAddressMismatch,
+    SPIFFEMismatch,
     VerificationError,
 )
 from service_identity.hazmat import (
@@ -12,6 +13,8 @@ from service_identity.hazmat import (
     DNSPattern,
     IPAddress_ID,
     IPAddressPattern,
+    SPIFFE_ID,
+    SPIFFEPattern,
     URIPattern,
 )
 from service_identity.pyopenssl import (
@@ -19,6 +22,7 @@ from service_identity.pyopenssl import (
     extract_patterns,
     verify_hostname,
     verify_ip_address,
+    verify_spiffe_id,
 )
 
 from .certificates import (
@@ -26,11 +30,12 @@ from .certificates import (
     PEM_DNS_ONLY,
     PEM_EVERYTHING,
     PEM_OTHER_NAME,
+    make_cert_with_sans,
 )
 
 
 if pytest.importorskip("OpenSSL"):
-    from OpenSSL.crypto import FILETYPE_PEM, load_certificate
+    from OpenSSL.crypto import FILETYPE_PEM, X509, load_certificate
 
 
 CERT_DNS_ONLY = load_certificate(FILETYPE_PEM, PEM_DNS_ONLY)
@@ -159,3 +164,54 @@ class TestExtractPatterns:
             == w.message.args[0]
         )
         assert __file__ == w.filename
+
+
+class TestVerifySPIFFEID:
+    def test_verify_spiffe_id_ok(self):
+        """
+        verify_spiffe_id succeeds if the certificate contains the exact
+        SPIFFE ID and the trust domain is allowed.
+        """
+        cert = make_cert_with_sans(
+            uris=["spiffe://example.com/ns/default/sa/web"]
+        )
+
+        class FakeConnection:
+            def get_peer_certificate(self):
+                return X509.from_cryptography(cert)
+
+        matches = verify_spiffe_id(
+            FakeConnection(),
+            "spiffe://example.com/ns/default/sa/web",
+            ["example.com"],
+        )
+
+        assert 1 == len(matches)
+        assert (
+            SPIFFEPattern.from_bytes(b"spiffe://example.com/ns/default/sa/web")
+            == matches[0].cert_pattern
+        )
+
+    def test_verify_spiffe_id_fail(self):
+        """
+        verify_spiffe_id fails if the SPIFFE ID does not match.
+        """
+
+        class FakeConnection:
+            def get_peer_certificate(self):
+                return X509.from_cryptography(
+                    make_cert_with_sans(uris=["spiffe://example.com/ns/a"])
+                )
+
+        with pytest.raises(VerificationError) as ei:
+            verify_spiffe_id(
+                FakeConnection(),
+                "spiffe://example.com/ns/b",
+                ["example.com"],
+            )
+
+        assert [
+            SPIFFEMismatch(
+                mismatched_id=SPIFFE_ID("spiffe://example.com/ns/b")
+            )
+        ] == ei.value.errors

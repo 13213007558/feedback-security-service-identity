@@ -4,7 +4,7 @@ API
 
 .. note::
 
-   So far, public high-level APIs are only available for host names (:rfc:`6125`) and IP addresses (:rfc:`2818`).
+   So far, public high-level APIs are only available for host names (:rfc:`6125`), IP addresses (:rfc:`2818`), and SPIFFE IDs.
    All IDs specified by :rfc:`6125` are already implemented though.
    If you'd like to play with them and provide feedback have a look at the ``verify_service_identity`` function in the `hazmat module <https://github.com/pyca/service-identity/blob/main/src/service_identity/hazmat.py>`_.
 
@@ -16,6 +16,13 @@ PyCA cryptography
 
 .. autofunction:: verify_certificate_hostname
 .. autofunction:: verify_certificate_ip_address
+.. autofunction:: verify_certificate_spiffe_id
+
+   In practice, this may look like the following:
+
+   .. include:: spiffe_example.py
+      :literal:
+
 .. autofunction:: extract_patterns
 
 
@@ -32,6 +39,7 @@ pyOpenSSL
       :literal:
 
 .. autofunction:: verify_ip_address
+.. autofunction:: verify_spiffe_id
 .. autofunction:: extract_patterns
 
 
@@ -65,6 +73,8 @@ They each carry the attributes that are necessary to match an ID of their type.
 .. autoclass:: URIPattern
    :members:
 .. autoclass:: SRVPattern
+   :members:
+.. autoclass:: SPIFFEPattern
    :members:
 
 
