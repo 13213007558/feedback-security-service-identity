@@ -68,6 +68,20 @@ They each carry the attributes that are necessary to match an ID of their type.
    :members:
 
 
+Reusable Compiled Patterns
+--------------------------
+
+A gateway that verifies several service identities against the same
+certificate -- for example a certificate carrying a large SAN list -- pays the
+cost of parsing and scanning the patterns once and reuses an index on every
+subsequent verification.
+
+.. autoclass:: CompiledPatterns
+   :members:
+
+.. autofunction:: verify_service_identity
+
+
 Universal Errors and Warnings
 =============================
 

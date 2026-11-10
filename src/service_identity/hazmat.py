@@ -8,7 +8,7 @@ import ipaddress
 import re
 
 from collections.abc import Sequence
-from typing import Protocol, runtime_checkable
+from typing import Protocol, TypeVar, runtime_checkable
 
 import attr
 
@@ -39,8 +39,249 @@ class ServiceMatch:
     cert_pattern: CertificatePattern = attr.ib()
 
 
+@attr.s(slots=True)
+class CompiledPatterns:
+    """
+    A reusable, indexed view over the patterns of one certificate.
+
+    Building a :class:`CompiledPatterns` performs the same validation as
+    passing the patterns to :func:`verify_service_identity` directly: every
+    pattern is expected to have been produced by one of the ``from_bytes``
+    constructors already, so no invalid SAN can be hidden by the indexing.
+
+    The object snapshots its input into a private tuple and never shares the
+    caller's list; later mutations of that list therefore cannot corrupt the
+    index, and two certificates always get independent indexes.
+
+    Candidates for a service ID are narrowed by identity type and, where it
+    is provably safe, by a key derived from the existing matching rules:
+
+    * DNS IDs only consider DNS patterns, further split into exact patterns
+      and wildcard patterns sharing the hostname's tail;
+    * URI IDs only consider URI patterns with the same protocol;
+    * SRV IDs only consider SRV patterns with the same service name;
+    * IP address IDs only consider the pattern carrying the same address.
+
+    Wildcard DNS matching, URI service types and SRV names keep following
+    the rules of their respective ``ServiceID.verify`` implementations.
+    """
+
+    _patterns: tuple[CertificatePattern, ...] = attr.ib()
+    _dns_exact: dict[bytes, tuple[int, ...]] = attr.ib()
+    _dns_wildcards: dict[bytes, tuple[int, ...]] = attr.ib()
+    _uri: dict[bytes, tuple[int, ...]] = attr.ib()
+    _srv: dict[bytes, tuple[int, ...]] = attr.ib()
+    _ip: dict[
+        ipaddress.IPv4Address | ipaddress.IPv6Address, tuple[int, ...]
+    ] = attr.ib()
+    _other: tuple[int, ...] = attr.ib()
+
+    @classmethod
+    def compile(
+        cls, cert_patterns: Sequence[CertificatePattern]
+    ) -> CompiledPatterns:
+        """
+        Build an index over *cert_patterns*.
+
+        The caller's sequence is snapshotted into a private tuple: appending,
+        removing or reordering it afterwards cannot change the compiled
+        result, and each certificate gets an independent index.  The pattern
+        objects themselves are the validated value objects produced by the
+        ``from_bytes`` constructors and are shared, not duplicated, so object
+        identity is preserved.
+        """
+        patterns = tuple(cert_patterns)
+
+        dns_exact: dict[bytes, list[int]] = {}
+        dns_wildcards: dict[bytes, list[int]] = {}
+        uri: dict[bytes, list[int]] = {}
+        srv: dict[bytes, list[int]] = {}
+        ip: dict[
+            ipaddress.IPv4Address | ipaddress.IPv6Address, list[int]
+        ] = {}
+        other: list[int] = []
+
+        for index, pattern in enumerate(patterns):
+            if pattern.__class__ is DNSPattern:
+                if b"*" in pattern.pattern:
+                    tail = pattern.pattern.split(b".", 1)[1]
+                    dns_wildcards.setdefault(tail, []).append(index)
+                else:
+                    dns_exact.setdefault(pattern.pattern, []).append(index)
+            elif pattern.__class__ is URIPattern:
+                uri.setdefault(pattern.protocol_pattern, []).append(index)
+            elif pattern.__class__ is SRVPattern:
+                srv.setdefault(pattern.name_pattern, []).append(index)
+            elif pattern.__class__ is IPAddressPattern:
+                ip.setdefault(pattern.pattern, []).append(index)
+            else:
+                other.append(index)
+
+        return cls(
+            patterns,
+            _freeze(dns_exact),
+            _freeze(dns_wildcards),
+            _freeze(uri),
+            _freeze(srv),
+            _freeze(ip),
+            tuple(other),
+        )
+
+    @property
+    def patterns(self) -> tuple[CertificatePattern, ...]:
+        """
+        The indexed certificate patterns in their original order.
+        """
+        return self._patterns
+
+    def verify(
+        self,
+        obligatory_ids: Sequence[ServiceID],
+        optional_ids: Sequence[ServiceID] = (),
+    ) -> list[ServiceMatch]:
+        """
+        Verify whether the indexed patterns are valid for the given IDs.
+
+        *obligatory_ids* must be both present and match.  *optional_ids*
+        must match if a pattern of the respective type is present; their
+        semantics are unchanged when no pattern of that type exists.
+        """
+        if not self._patterns:
+            msg = "Certificate does not contain any `subjectAltName`s."
+            raise CertificateError(msg)
+
+        matches = self._find_matches(obligatory_ids) + self._find_matches(
+            optional_ids
+        )
+
+        matched_ids = [match.service_id for match in matches]
+        errors = []
+        for service_id in obligatory_ids:
+            if service_id not in matched_ids:
+                errors.append(  # noqa: PERF401
+                    service_id.error_on_mismatch(mismatched_id=service_id)
+                )
+
+        for service_id in optional_ids:
+            # If an optional ID is not matched by a certificate pattern
+            # *but* there is a pattern of the same type, it is an error and
+            # the verification fails.  Example: the user passes a SRV-ID for
+            # "_mail.domain.com" but the certificate contains an SRV-Pattern
+            # for "_xmpp.domain.com".
+            if service_id not in matched_ids and (
+                self._contains_pattern_type(service_id.pattern_class)
+            ):
+                errors.append(  # noqa: PERF401
+                    service_id.error_on_mismatch(mismatched_id=service_id)
+                )
+
+        if errors:
+            raise VerificationError(errors=errors)
+
+        return matches
+
+    def _find_matches(
+        self, service_ids: Sequence[ServiceID]
+    ) -> list[ServiceMatch]:
+        matches = []
+        for service_id in service_ids:
+            for index in self._candidates_for(service_id):
+                cert_pattern = self._patterns[index]
+                if service_id.verify(cert_pattern):
+                    matches.append(  # noqa: PERF401
+                        ServiceMatch(
+                            cert_pattern=cert_pattern,
+                            service_id=service_id,
+                        )
+                    )
+
+        return matches
+
+    def _candidates_for(self, service_id: ServiceID) -> tuple[int, ...]:
+        pattern_class = service_id.pattern_class
+        if pattern_class is DNSPattern:
+            hostname = service_id.hostname  # type: ignore[attr-defined]
+            candidates = _merge_indexes(
+                self._dns_exact.get(hostname, ()),
+                self._wildcard_candidates_for(hostname),
+            )
+        elif pattern_class is URIPattern:
+            protocol = service_id.protocol  # type: ignore[attr-defined]
+            candidates = self._uri.get(protocol, ())
+        elif pattern_class is SRVPattern:
+            name = service_id.name  # type: ignore[attr-defined]
+            candidates = self._srv.get(name, ())
+        elif pattern_class is IPAddressPattern:
+            ip = service_id.ip  # type: ignore[attr-defined]
+            candidates = self._ip.get(ip, ())
+        else:
+            # An unknown ID type may match any pattern, so keep the full
+            # scan, which already covers the "other" bucket.
+            return tuple(range(len(self._patterns)))
+
+        # Patterns of unknown types stay eligible for known IDs.
+        if self._other:
+            candidates = _merge_indexes(candidates, self._other)
+
+        return candidates
+
+    def _wildcard_candidates_for(self, hostname: bytes) -> tuple[int, ...]:
+        # A wildcard always matches at least two DNS labels, so a
+        # single-label hostname can never be a candidate.
+        if b"." not in hostname:
+            return ()
+
+        tail = hostname.split(b".", 1)[1]
+
+        return self._dns_wildcards.get(tail, ())
+
+    def _contains_known_pattern_type(self, pattern_class: type) -> bool:
+        if pattern_class is DNSPattern:
+            return bool(self._dns_exact or self._dns_wildcards)
+        if pattern_class is URIPattern:
+            return bool(self._uri)
+        if pattern_class is SRVPattern:
+            return bool(self._srv)
+
+        return bool(self._ip)
+
+    def _contains_pattern_type(self, pattern_class: type) -> bool:
+        if pattern_class in _KNOWN_PATTERN_CLASSES:
+            return self._contains_known_pattern_type(pattern_class)
+
+        return _contains_instance_of(self._patterns, pattern_class)
+
+
+_T = TypeVar("_T")
+
+
+def _freeze(index: dict[_T, list[int]]) -> dict[_T, tuple[int, ...]]:
+    return {key: tuple(positions) for key, positions in index.items()}
+
+
+def _merge_indexes(
+    left: tuple[int, ...], right: tuple[int, ...]
+) -> tuple[int, ...]:
+    """
+    Merge two sorted tuples of pattern indexes into sorted order.
+    """
+    merged: list[int] = []
+    i = j = 0
+    while i < len(left) and j < len(right):
+        if left[i] <= right[j]:
+            merged.append(left[i])
+            i += 1
+        else:
+            merged.append(right[j])
+            j += 1
+    merged.extend(left[i:])
+    merged.extend(right[j:])
+
+    return tuple(merged)
+
+
 def verify_service_identity(
-    cert_patterns: Sequence[CertificatePattern],
+    cert_patterns: Sequence[CertificatePattern] | CompiledPatterns,
     obligatory_ids: Sequence[ServiceID],
     optional_ids: Sequence[ServiceID],
 ) -> list[ServiceMatch]:
@@ -48,41 +289,19 @@ def verify_service_identity(
     Verify whether *cert_patterns* are valid for *obligatory_ids* and
     *optional_ids*.
 
+    *cert_patterns* may either be a sequence of certificate patterns as
+    returned by the ``extract_patterns`` functions or a reusable
+    :class:`CompiledPatterns` built from such a sequence.
+
     *obligatory_ids* must be both present and match.  *optional_ids* must match
     if a pattern of the respective type is present.
     """
-    if not cert_patterns:
-        msg = "Certificate does not contain any `subjectAltName`s."
-        raise CertificateError(msg)
+    if isinstance(cert_patterns, CompiledPatterns):
+        compiled = cert_patterns
+    else:
+        compiled = CompiledPatterns.compile(cert_patterns)
 
-    errors = []
-    matches = _find_matches(cert_patterns, obligatory_ids) + _find_matches(
-        cert_patterns, optional_ids
-    )
-
-    matched_ids = [match.service_id for match in matches]
-    for i in obligatory_ids:
-        if i not in matched_ids:
-            errors.append(  # noqa: PERF401
-                i.error_on_mismatch(mismatched_id=i)
-            )
-
-    for i in optional_ids:
-        # If an optional ID is not matched by a certificate pattern *but* there
-        # is a pattern of the same type , it is an error and the verification
-        # fails.  Example: the user passes a SRV-ID for "_mail.domain.com" but
-        # the certificate contains an SRV-Pattern for "_xmpp.domain.com".
-        if i not in matched_ids and _contains_instance_of(
-            cert_patterns, i.pattern_class
-        ):
-            errors.append(  # noqa: PERF401
-                i.error_on_mismatch(mismatched_id=i)
-            )
-
-    if errors:
-        raise VerificationError(errors=errors)
-
-    return matches
+    return compiled.verify(obligatory_ids, optional_ids)
 
 
 def _find_matches(
@@ -91,6 +310,9 @@ def _find_matches(
 ) -> list[ServiceMatch]:
     """
     Search for matching certificate patterns and service_ids.
+
+    This is the unindexed reference scan; production code paths use a
+    :class:`CompiledPatterns` instead.
 
     Args:
         service_ids: List of service IDs like DNS_ID.
@@ -259,6 +481,11 @@ CertificatePattern = SRVPattern | URIPattern | DNSPattern | IPAddressPattern
 A :class:`Union` of all possible patterns that can be extracted from a
 certificate.
 """
+
+
+_KNOWN_PATTERN_CLASSES = frozenset(
+    {DNSPattern, URIPattern, SRVPattern, IPAddressPattern}
+)
 
 
 @runtime_checkable

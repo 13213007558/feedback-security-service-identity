@@ -15,6 +15,11 @@ You can find out backwards-compatibility policy [here](https://github.com/pyca/s
 
 ## [Unreleased](https://github.com/pyca/service-identity/compare/26.1.0...HEAD)
 
+### Added
+
+- A reusable `service_identity.hazmat.CompiledPatterns` index that compiles a certificate's patterns once and narrows candidate matching by identity type (exact/wildcard DNS tails, URI protocol, SRV service name, IP address), so repeated verification of the same certificate no longer rescans and re-parses every SAN.
+  `verify_service_identity` now also accepts a compiled object in addition to the existing list input; matches, error categories, ordering and optional-ID semantics remain identical to the linear scan.
+
 ### Removed
 
 - Support for Python 3.8 and 3.9.
